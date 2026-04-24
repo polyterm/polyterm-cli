@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
@@ -10,23 +10,45 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
+use polymarket_client_sdk::clob;
+use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
+use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
 use polymarket_client_sdk::gamma;
 use polymarket_client_sdk::gamma::types::request::MarketsRequest;
 use polymarket_client_sdk::gamma::types::response::Market;
+use polymarket_client_sdk::types::U256;
 
 const MENU_ITEMS: &[&str] = &["Markets"];
+const BOOK_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 #[derive(PartialEq)]
 enum View {
     Menu,
     Markets,
+    OrderBook,
 }
 
 type MarketsResult = std::result::Result<Vec<Market>, String>;
+
+enum BookUpdate {
+    Ok(OrderBookSummaryResponse),
+    Err(String),
+}
+
+struct BookState {
+    market: Market,
+    token_ids: Vec<U256>,
+    outcome_idx: usize,
+    book: Option<OrderBookSummaryResponse>,
+    loading: bool,
+    error: Option<String>,
+    updated_at: Option<Instant>,
+}
 
 struct App {
     view: View,
@@ -37,6 +59,8 @@ struct App {
     error: Option<String>,
     should_quit: bool,
     markets_rx: Option<mpsc::Receiver<MarketsResult>>,
+    book: Option<BookState>,
+    book_rx: Option<mpsc::UnboundedReceiver<BookUpdate>>,
 }
 
 impl App {
@@ -52,6 +76,8 @@ impl App {
             error: None,
             should_quit: false,
             markets_rx: None,
+            book: None,
+            book_rx: None,
         }
     }
 
@@ -59,7 +85,8 @@ impl App {
         while !self.should_quit {
             terminal.draw(|f| self.render(f))?;
             self.poll_events()?;
-            self.poll_async_results();
+            self.poll_markets_result();
+            self.poll_book_result();
         }
         Ok(())
     }
@@ -78,6 +105,7 @@ impl App {
         let title_text = match self.view {
             View::Menu => "polyterm".to_string(),
             View::Markets => "polyterm › markets".to_string(),
+            View::OrderBook => "polyterm › markets › book".to_string(),
         };
         let title = Paragraph::new(title_text)
             .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
@@ -87,11 +115,13 @@ impl App {
         match self.view {
             View::Menu => self.render_menu(f, chunks[1]),
             View::Markets => self.render_markets(f, chunks[1]),
+            View::OrderBook => self.render_book(f, chunks[1]),
         }
 
         let hints = match self.view {
             View::Menu => " j/k: move   enter: open   q: quit ",
-            View::Markets => " j/k: scroll   esc: back   q: quit ",
+            View::Markets => " j/k: scroll   enter: open book   esc: back   q: quit ",
+            View::OrderBook => " tab: yes/no   esc: back   q: quit ",
         };
         let footer = Paragraph::new(hints).style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer, chunks[2]);
@@ -125,7 +155,7 @@ impl App {
             return;
         }
 
-        let question_width: usize = area.width.saturating_sub(24).max(20) as usize;
+        let q_width: usize = area.width.saturating_sub(24).max(20) as usize;
         let items: Vec<ListItem> = self
             .markets
             .iter()
@@ -133,10 +163,9 @@ impl App {
                 let q = m.question.as_deref().unwrap_or("—");
                 let liq = m
                     .liquidity
-                    .map(|l| l.to_string().parse::<f64>().unwrap_or(0.0))
                     .map(|l| format!("${:>10.0}", l))
                     .unwrap_or_else(|| "         —".to_string());
-                let line = format!("{:<width$}  {}", truncate(q, question_width), liq, width = question_width);
+                let line = format!("{:<width$}  {}", truncate(q, q_width), liq, width = q_width);
                 ListItem::new(line)
             })
             .collect();
@@ -153,13 +182,131 @@ impl App {
         f.render_stateful_widget(list, area, &mut self.markets_state);
     }
 
+    fn render_book(&mut self, f: &mut Frame, area: Rect) {
+        let Some(state) = &self.book else {
+            return;
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(1)])
+            .split(area);
+
+        let question = state.market.question.as_deref().unwrap_or("—");
+        let outcome = state
+            .market
+            .outcomes
+            .as_ref()
+            .and_then(|v| v.get(state.outcome_idx))
+            .cloned()
+            .unwrap_or_else(|| format!("outcome-{}", state.outcome_idx));
+        let updated = state
+            .updated_at
+            .map(|t| {
+                let ms = t.elapsed().as_millis();
+                if ms < 1000 {
+                    format!("updated {ms}ms ago")
+                } else {
+                    format!("updated {}s ago", ms / 1000)
+                }
+            })
+            .unwrap_or_else(|| "waiting…".into());
+        let last = state
+            .book
+            .as_ref()
+            .and_then(|b| b.last_trade_price)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "—".into());
+
+        let header = Paragraph::new(vec![
+            Line::from(Span::styled(
+                truncate(question, area.width.saturating_sub(2) as usize),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("outcome: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    &outcome,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("    last: {last}    {updated}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ]);
+        f.render_widget(header, chunks[0]);
+
+        if let Some(err) = &state.error {
+            let p = Paragraph::new(format!("Error: {err}"))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(p, chunks[1]);
+            return;
+        }
+        if state.loading && state.book.is_none() {
+            let p = Paragraph::new("Subscribing to order book…").alignment(Alignment::Center);
+            f.render_widget(p, chunks[1]);
+            return;
+        }
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+
+        let (bid_items, ask_items): (Vec<ListItem>, Vec<ListItem>) = state
+            .book
+            .as_ref()
+            .map(|b| {
+                let mut bids = b.bids.clone();
+                bids.sort_by(|a, b| b.price.cmp(&a.price));
+                let mut asks = b.asks.clone();
+                asks.sort_by(|a, b| a.price.cmp(&b.price));
+                let bi: Vec<ListItem> = bids
+                    .iter()
+                    .map(|o| ListItem::new(format!("  {:>8}    {:>12}", o.price, o.size)))
+                    .collect();
+                let ai: Vec<ListItem> = asks
+                    .iter()
+                    .map(|o| ListItem::new(format!("  {:>8}    {:>12}", o.price, o.size)))
+                    .collect();
+                (bi, ai)
+            })
+            .unwrap_or_default();
+
+        let bids_widget = List::new(bid_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" bids ")
+                    .style(Style::default().fg(Color::Green)),
+            )
+            .style(Style::default().fg(Color::Green));
+        let asks_widget = List::new(ask_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" asks ")
+                    .style(Style::default().fg(Color::Red)),
+            )
+            .style(Style::default().fg(Color::Red));
+        f.render_widget(bids_widget, cols[0]);
+        f.render_widget(asks_widget, cols[1]);
+    }
+
     fn poll_events(&mut self) -> Result<()> {
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.on_key(key.code, key.modifiers);
-            }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            self.on_key(key.code, key.modifiers);
         }
         Ok(())
     }
@@ -192,6 +339,20 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => {
                     step(&mut self.markets_state, self.markets.len(), -1);
                 }
+                KeyCode::Enter => self.open_selected_market(),
+                _ => {}
+            },
+            View::OrderBook => match code {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') => {
+                    self.close_book();
+                }
+                KeyCode::Tab | KeyCode::Char('n') | KeyCode::Right | KeyCode::Char('l') => {
+                    self.toggle_outcome();
+                }
+                KeyCode::BackTab | KeyCode::Char('y') | KeyCode::Left => {
+                    self.toggle_outcome();
+                }
                 _ => {}
             },
         }
@@ -201,13 +362,86 @@ impl App {
         let Some(idx) = self.menu_state.selected() else {
             return;
         };
-        match MENU_ITEMS.get(idx) {
-            Some(&"Markets") => {
-                self.view = View::Markets;
-                self.fetch_markets();
-            }
-            _ => {}
+        if MENU_ITEMS.get(idx) == Some(&"Markets") {
+            self.view = View::Markets;
+            self.fetch_markets();
         }
+    }
+
+    fn open_selected_market(&mut self) {
+        let Some(idx) = self.markets_state.selected() else {
+            return;
+        };
+        let Some(market) = self.markets.get(idx).cloned() else {
+            return;
+        };
+        let Some(token_ids) = market.clob_token_ids.clone() else {
+            self.error = Some("Market has no CLOB token IDs".into());
+            return;
+        };
+        if token_ids.is_empty() {
+            self.error = Some("Market has no CLOB token IDs".into());
+            return;
+        }
+        self.book = Some(BookState {
+            market,
+            token_ids,
+            outcome_idx: 0,
+            book: None,
+            loading: true,
+            error: None,
+            updated_at: None,
+        });
+        self.view = View::OrderBook;
+        self.start_book_polling();
+    }
+
+    fn toggle_outcome(&mut self) {
+        if let Some(state) = &mut self.book {
+            let n = state.token_ids.len();
+            if n <= 1 {
+                return;
+            }
+            state.outcome_idx = (state.outcome_idx + 1) % n;
+            state.book = None;
+            state.loading = true;
+            state.error = None;
+            state.updated_at = None;
+        }
+        self.start_book_polling();
+    }
+
+    fn close_book(&mut self) {
+        self.book = None;
+        self.book_rx = None; // drops receiver, polling task exits
+        self.view = View::Markets;
+    }
+
+    fn start_book_polling(&mut self) {
+        let Some(state) = &self.book else {
+            return;
+        };
+        let Some(&token_id) = state.token_ids.get(state.outcome_idx) else {
+            return;
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.book_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let client = clob::Client::default();
+            loop {
+                let req = OrderBookSummaryRequest::builder().token_id(token_id).build();
+                let update = match client.order_book(&req).await {
+                    Ok(book) => BookUpdate::Ok(book),
+                    Err(e) => BookUpdate::Err(e.to_string()),
+                };
+                if tx.send(update).is_err() {
+                    break;
+                }
+                tokio::time::sleep(BOOK_POLL_INTERVAL).await;
+            }
+        });
     }
 
     fn fetch_markets(&mut self) {
@@ -231,7 +465,7 @@ impl App {
         });
     }
 
-    fn poll_async_results(&mut self) {
+    fn poll_markets_result(&mut self) {
         let Some(rx) = self.markets_rx.as_mut() else {
             return;
         };
@@ -253,6 +487,37 @@ impl App {
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 self.loading = false;
                 self.markets_rx = None;
+            }
+        }
+    }
+
+    fn poll_book_result(&mut self) {
+        let Some(rx) = self.book_rx.as_mut() else {
+            return;
+        };
+        // Drain all pending updates to keep the UI fresh.
+        loop {
+            match rx.try_recv() {
+                Ok(update) => {
+                    if let Some(state) = &mut self.book {
+                        state.loading = false;
+                        state.updated_at = Some(Instant::now());
+                        match update {
+                            BookUpdate::Ok(book) => {
+                                state.book = Some(book);
+                                state.error = None;
+                            }
+                            BookUpdate::Err(e) => {
+                                state.error = Some(e);
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.book_rx = None;
+                    break;
+                }
             }
         }
     }
