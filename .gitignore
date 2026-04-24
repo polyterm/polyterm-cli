@@ -1,1 +1,5 @@
 /target
+
+# Demo recording artifacts (render locally with `vhs demo.tape`)
+demo.gif
+*.cast
