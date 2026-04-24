@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
+polymarket-client-sdk = { version = "0.4", features = ["gamma", "data", "bridge", "clob", "ctf"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
