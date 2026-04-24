@@ -35,6 +35,15 @@ Plain CLI output, for scripting:
 polyterm markets --limit 10
 ```
 
+## Demo
+
+A [VHS](https://github.com/charmbracelet/vhs) tape is in [`demo.tape`](./demo.tape). Render it locally:
+
+```bash
+cargo build --release
+vhs demo.tape    # produces demo.gif
+```
+
 ## Roadmap
 
 - [x] TUI menu + markets browser
